@@ -1,0 +1,193 @@
+import torch
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+from model import PINN
+from utils import (
+    generate_collocation_points,
+    generate_boundary_points,
+    analytical_solution
+)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+EPSILON_TRUE = 2.5
+N_EPOCHS = 5000
+
+def train_inverse(n_obs=20, noise_level=0.0, lambda_data=100.0, seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    model = PINN(layers=[2, 50, 50, 50, 50, 1]).to(device)
+    epsilon = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    optimizer = optim.Adam(list(model.parameters()) + [epsilon], lr=1e-3)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
+
+    x_col, y_col = generate_collocation_points(n_points=3000, device=device)
+    x_bc, y_bc, phi_bc = generate_boundary_points(n_points=200, device=device)
+
+    x_obs_np = np.random.rand(n_obs, 1)
+    y_obs_np = np.random.rand(n_obs, 1)
+    phi_clean = analytical_solution(x_obs_np, y_obs_np) * EPSILON_TRUE
+
+    noise = np.random.normal(0, noise_level * np.abs(phi_clean), phi_clean.shape)
+    phi_obs_np = phi_clean + noise
+
+    x_obs = torch.tensor(x_obs_np, dtype=torch.float32, device=device)
+    y_obs = torch.tensor(y_obs_np, dtype=torch.float32, device=device)
+    phi_obs = torch.tensor(phi_obs_np, dtype=torch.float32, device=device)
+
+    for epoch in range(N_EPOCHS):
+        model.train()
+        optimizer.zero_grad()
+
+        x_c = x_col.requires_grad_(True)
+        y_c = y_col.requires_grad_(True)
+        phi = model(x_c, y_c)
+        phi_x = torch.autograd.grad(phi, x_c, grad_outputs=torch.ones_like(phi), create_graph=True)[0]
+        phi_y = torch.autograd.grad(phi, y_c, grad_outputs=torch.ones_like(phi), create_graph=True)[0]
+        phi_xx = torch.autograd.grad(phi_x, x_c, grad_outputs=torch.ones_like(phi_x), create_graph=True)[0]
+        phi_yy = torch.autograd.grad(phi_y, y_c, grad_outputs=torch.ones_like(phi_y), create_graph=True)[0]
+        loss_pde = torch.mean((phi_xx + phi_yy) ** 2)
+
+        loss_bc = torch.mean((model(x_bc, y_bc) - phi_bc) ** 2)
+
+        loss_data = torch.mean((model(x_obs, y_obs) * epsilon - phi_obs) ** 2)
+
+        loss = loss_pde + 10.0 * loss_bc + lambda_data * loss_data
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+    optimizer_lbfgs = optim.LBFGS(
+        list(model.parameters()) + [epsilon],
+        lr=1.0,
+        max_iter=200,
+        line_search_fn='strong_wolfe'
+    )
+
+    def closure():
+        optimizer_lbfgs.zero_grad()
+        x_c = x_col.requires_grad_(True)
+        y_c = y_col.requires_grad_(True)
+        phi = model(x_c, y_c)
+        phi_x = torch.autograd.grad(phi, x_c, grad_outputs=torch.ones_like(phi), create_graph=True)[0]
+        phi_y = torch.autograd.grad(phi, y_c, grad_outputs=torch.ones_like(phi), create_graph=True)[0]
+        phi_xx = torch.autograd.grad(phi_x, x_c, grad_outputs=torch.ones_like(phi_x), create_graph=True)[0]
+        phi_yy = torch.autograd.grad(phi_y, y_c, grad_outputs=torch.ones_like(phi_y), create_graph=True)[0]
+        loss_pde = torch.mean((phi_xx + phi_yy) ** 2)
+        loss_bc = torch.mean((model(x_bc, y_bc) - phi_bc) ** 2)
+        loss_data = torch.mean((model(x_obs, y_obs) * epsilon - phi_obs) ** 2)
+        loss = loss_pde + 10.0 * loss_bc + lambda_data * loss_data
+        loss.backward()
+        return loss
+
+    optimizer_lbfgs.step(closure)
+
+    epsilon_pred = epsilon.item()
+    rel_error = abs(epsilon_pred - EPSILON_TRUE) / EPSILON_TRUE * 100
+    return epsilon_pred, rel_error
+
+
+print("=" * 50)
+print("Experiment 1: Ablation Study on Number of Observation Points")
+print("=" * 50)
+
+obs_list = [5, 10, 20, 30, 50]
+errors_obs = []
+epsilons_obs = []
+
+for n_obs in obs_list:
+    print(f"  Number of observation points n_obs={n_obs} ...", end=' ')
+    eps_pred, rel_err = train_inverse(n_obs=n_obs, noise_level=0.0)
+    errors_obs.append(rel_err)
+    epsilons_obs.append(eps_pred)
+    print(f"epsilon={eps_pred:.4f}, error={rel_err:.4f}%")
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].plot(obs_list, errors_obs, 'bo-', linewidth=2, markersize=8)
+axes[0].set_xlabel('Number of Observation Points')
+axes[0].set_ylabel('Relative Error (%)')
+axes[0].set_title('Effect of Observation Points on\nPermittivity Identification')
+axes[0].grid(True)
+for i, (n, e) in enumerate(zip(obs_list, errors_obs)):
+    axes[0].annotate(
+        f'{e:.3f}%',
+        (n, errors_obs[i]),
+        textcoords="offset points",
+        xytext=(0, 10),
+        ha='center'
+    )
+
+axes[1].plot(obs_list, epsilons_obs, 'bo-', linewidth=2, markersize=8, label='Predicted ε')
+axes[1].axhline(y=EPSILON_TRUE, color='r', linestyle='--', linewidth=2, label=f'True ε={EPSILON_TRUE}')
+axes[1].set_xlabel('Number of Observation Points')
+axes[1].set_ylabel('Predicted ε')
+axes[1].set_title('Predicted Permittivity vs\nNumber of Observation Points')
+axes[1].legend()
+axes[1].grid(True)
+
+plt.suptitle('Ablation Study: Observation Points', fontsize=13)
+plt.tight_layout()
+plt.savefig('figures/ablation_obs_points.png', dpi=150)
+plt.show()
+print("Figure saved: figures/ablation_obs_points.png\n")
+
+print("=" * 50)
+print("Experiment 2: Noise Robustness Test")
+print("=" * 50)
+
+noise_list = [0.0, 0.01, 0.03, 0.05, 0.10]
+errors_noise = []
+epsilons_noise = []
+
+for noise in noise_list:
+    print(f"  Noise level {noise * 100:.0f}% ...", end=' ')
+    eps_pred, rel_err = train_inverse(n_obs=20, noise_level=noise)
+    errors_noise.append(rel_err)
+    epsilons_noise.append(eps_pred)
+    print(f"epsilon={eps_pred:.4f}, error={rel_err:.4f}%")
+
+noise_labels = [f'{int(n * 100)}%' for n in noise_list]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].bar(noise_labels, errors_noise, color='steelblue', edgecolor='black')
+axes[0].set_xlabel('Noise Level')
+axes[0].set_ylabel('Relative Error (%)')
+axes[0].set_title('Effect of Measurement Noise on\nPermittivity Identification')
+axes[0].grid(True, axis='y')
+for i, e in enumerate(errors_noise):
+    axes[0].text(i, e + 0.01, f'{e:.3f}%', ha='center', fontsize=9)
+
+axes[1].plot(noise_labels, epsilons_noise, 'rs-', linewidth=2, markersize=8, label='Predicted ε')
+axes[1].axhline(y=EPSILON_TRUE, color='b', linestyle='--', linewidth=2, label=f'True ε={EPSILON_TRUE}')
+axes[1].set_xlabel('Noise Level')
+axes[1].set_ylabel('Predicted ε')
+axes[1].set_title('Predicted Permittivity vs\nMeasurement Noise Level')
+axes[1].legend()
+axes[1].grid(True)
+
+plt.suptitle('Noise Robustness Analysis', fontsize=13)
+plt.tight_layout()
+plt.savefig('figures/noise_robustness.png', dpi=150)
+plt.show()
+print("Figure saved: figures/noise_robustness.png\n")
+
+print("=" * 50)
+print("Summary of Experiments")
+print("=" * 50)
+
+print("\nExperiment 1: Ablation on Number of Observation Points")
+print(f"{'n_obs':>8} | {'epsilon':>10} | {'error':>10}")
+print("-" * 35)
+for n, e, err in zip(obs_list, epsilons_obs, errors_obs):
+    print(f"{n:>8} | {e:>10.4f} | {err:>9.4f}%")
+
+print("\nExperiment 2: Noise Robustness")
+print(f"{'noise':>8} | {'epsilon':>10} | {'error':>10}")
+print("-" * 35)
+for n, e, err in zip(noise_labels, epsilons_noise, errors_noise):
+    print(f"{n:>8} | {e:>10.4f} | {err:>9.4f}%")
