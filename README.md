@@ -1,6 +1,6 @@
 # Physics-Informed Neural Networks for 2D Electrostatic Field Reconstruction and Permittivity Identification
 
-Final project for [Course Name] — [University Name] — [Your Name]
+Final project for EE495 — Siyi Xu
 
 ## Table of Contents
 - [Overview](#overview)
